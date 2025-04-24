@@ -6,11 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rayon = "1.10.0"
+rayon = "*"
 sysinfo = "0.31.4"
 blake3 = "1.5.1"
 hex = "0.4.3"
-argon2 = "0.5.3"
+argon2 = "*"
 
 secrecy = { version = "0.8.0", features = ["alloc"] }
 hashbrown = { version = "0.14.5", features = ["rayon"] }
+rand = "*"
+once_cell = "*"
