@@ -93,7 +93,7 @@ pub(crate) fn kdfwagen(password: &[u8], salt: &[u8], iterations: usize) -> Secre
     const OUTPUT_SIZE: usize = 64;
 
     let mut result = Vec::new();
-    let mut block_count = (KEY_LENGTH + PRF_OUTPUT_SIZE - 1) / PRF_OUTPUT_SIZE;
+    let mut block_count = KEY_LENGTH.div_ceil(PRF_OUTPUT_SIZE);
 
     if block_count > 255 {
         block_count = 255;
