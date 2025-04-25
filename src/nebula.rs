@@ -212,7 +212,7 @@ fn reseed(&mut self, new_seed: u128) {
 
         // Lock the pool and add its bytes
         let mut pool = self.pool.lock().unwrap();
-        hasher.update(&pool.make_contiguous()); // Efficiently add all bytes in the pool
+        hasher.update(pool.make_contiguous()); // Efficiently add all bytes in the pool
 
         // Add additional entropy sources
         hasher.update(&self.last_reseed_time.to_be_bytes());
