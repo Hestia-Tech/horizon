@@ -417,59 +417,44 @@ pub(crate) fn generate_random_number(&mut self) -> u128 {
 /// }
 /// ```
 fn data_computer() -> Result<[u128; 10], SystemTrayError> {
-    let mut sys = System::new();
-    sys.refresh_memory();
-
-    let mut s = System::new();
-    s.refresh_processes(ProcessesToUpdate::All);
-
-    let total_memory = sys.total_memory();
-    let used_memory = sys.used_memory();
-    let total_swap = sys.total_swap();
-    let cpu = s.cpus().len() as u128;
-    let uptime = System::uptime() as u128;
-    let boot_time= System::boot_time() as u128;
-
-    let networks = Networks::new_with_refreshed_list();
-    let network_data: u128 = calculate_network_data(&networks);
-
-    let pid_set: HashSet<&Pid> = s.processes().keys().collect();
-    let pid_disk_usage: u128 = pid_set.into_par_iter()
-        .map(|&pid| calculate_disk_usage(&s, pid))
-        .sum();
-
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_nanos();
-
-    let pid = std::process::id();
-
-    Ok([time, pid.into(), total_memory as u128, used_memory as u128, total_swap as u128, pid_disk_usage, uptime, boot_time, network_data, cpu])
+    let mut m = System::new();
+    m.refresh_memory();
+    let mut p = System::new();
+    p.refresh_processes(ProcessesToUpdate::All);
+    let net = Networks::new_with_refreshed_list();
+    let nd: u128 = net.par_iter().map(|(_, n)| {
+        n.received() as u128
+            + n.total_received() as u128
+            + n.transmitted() as u128
+            + n.total_transmitted() as u128
+            + n.packets_received() as u128
+            + n.total_packets_received() as u128
+            + n.packets_transmitted() as u128
+            + n.total_packets_transmitted() as u128
+            + n.errors_on_received() as u128
+            + n.total_errors_on_received() as u128
+            + n.errors_on_transmitted() as u128
+    }).sum();
+    let pids: HashSet<&Pid> = p.processes().keys().collect();
+    let du: u128 = pids.into_par_iter().map(|&pid| {
+        p.process(pid).map_or(0, |pr| pr.disk_usage().total_read_bytes as u128)
+    }).sum();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let pid = std::process::id() as u128;
+    Ok([
+        now,
+        pid,
+        m.total_memory() as u128,
+        m.used_memory() as u128,
+        m.total_swap() as u128,
+        du,
+        System::uptime() as u128,
+        System::boot_time() as u128,
+        nd,
+        p.cpus().len() as u128,
+    ])
 }
 
-fn calculate_network_data(network: &Networks) -> u128 {
-    network.par_iter()
-        .map(|(_, network)| {
-            network.received() as u128
-                + network.total_received() as u128
-                + network.transmitted() as u128
-                + network.total_transmitted() as u128
-                + network.packets_received() as u128
-                + network.total_packets_received() as u128
-                + network.packets_transmitted() as u128
-                + network.total_packets_transmitted() as u128
-                + network.errors_on_received() as u128
-                + network.total_errors_on_received() as u128
-                + network.errors_on_transmitted() as u128
-        })
-        .sum()
-}
-
-fn calculate_disk_usage(sys: &System, pid: Pid) -> u128 {
-    sys.process(pid)
-        .map_or(0, |process| process.disk_usage().total_read_bytes as u128)
-}
 
 /// Generates a secured seed for cryptographic operations.
 ///
@@ -492,26 +477,13 @@ fn calculate_disk_usage(sys: &System, pid: Pid) -> u128 {
 /// let seed = secured_seed();
 /// ```
 pub fn secured_seed() -> u128 {
-    let actual_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_nanos();
-
-    let context_bytes: Vec<u8> = data_computer()
-        .unwrap()
-        .par_iter()
-        .flat_map(|&x| x.to_be_bytes())
-        .collect();
-
-    let key = kdfwagen(&context_bytes, &actual_time.to_be_bytes(), 10);
-    let key = key.expose_secret();
-
-    let (part1, part2): (&[u8], &[u8]) = key.split_at(256);
-
-    let sum1: u128 = part1.par_iter().map(|&x| x as u128).sum();
-    let sum2: u128 = part2.par_iter().map(|&x| x as u128).sum();
-
-    sum1.wrapping_mul(sum2)
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let ctx: Vec<u8> = data_computer().unwrap().par_iter().flat_map(|&x| x.to_be_bytes()).collect();
+    let key = kdfwagen(&ctx, &now.to_be_bytes(), 10).expose_secret().clone();
+    let (a, b) = key.split_at(256);
+    let s1: u128 = a.par_iter().map(|&x| x as u128).sum();
+    let s2: u128 = b.par_iter().map(|&x| x as u128).sum();
+    s1.wrapping_mul(s2)
 }
 
 /// Shuffles the elements of a slice.
