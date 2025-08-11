@@ -13,13 +13,14 @@ hex = "0.4.3"
 argon2 = "*"
 
 secrecy = { version = "0.8.0", features = ["alloc"] }
-hashbrown = { version = "0.14.5", features = ["rayon"] }
+hashbrown = { version = "0.15.5", features = ["rayon"] }
 rand = "*"
 once_cell = "*"
 hkdf = "0.13.0-rc.0"
 hmac = "0.13.0-rc.0"
 sha2 = "0.11.0-rc.0"
 zeroize = "1.8.1"
+dashmap = "7.0.0-rc2"
 
 [profile.release]
 lto = "fat"              # Link Time Optimization
