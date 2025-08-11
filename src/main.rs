@@ -1,448 +1,578 @@
 use std::error::Error;
-use std::sync::{Arc, Mutex};
-use argon2::Argon2;
-use once_cell::sync::Lazy;
+use std::sync::Arc;
 
+use argon2::{Argon2, Params};
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::{rng, RngCore};
 use hashbrown::HashMap;
-use rayon::prelude::*;
 use secrecy::{ExposeSecret, Secret};
-use sysinfo::System;
+use sha2::Sha256;
+use zeroize::Zeroize;
 
-use crate::cryptex::{decrypt_file, encrypt_file};
-use crate::nebula::{Nebula, secured_seed, seeded_shuffle};
-use crate::systemtrayerror::SystemTrayError;
-
-mod systemtrayerror;
-mod kdfwagen;
-mod cryptex;
-mod nebula;
+use std::collections::HashSet;
+use rayon::prelude::*;
+use std::sync::RwLock;
 
 const KEY_LENGTH: usize = 512;
+const SALT_LEN: usize = 16;
+type HmacSha256 = Hmac<Sha256>;
 
-/// Caching le sel sacré pour éviter des recalculs redondants  
-static SALT: Lazy<String> = Lazy::new(|| {
-    System::name().unwrap_or_default() +
-    &System::host_name().unwrap_or_default() +
-    &System::os_version().unwrap_or_default() +
-    &System::kernel_version().unwrap_or_default()
-});
 
-/// Génère une table tridimensionnelle optimisée, employant une granularité définie pour Rayon.
-/// Génère une table tridimensionnelle optimisée, employant une granularité définie pour Rayon.
-fn table3(size: usize, seed: u64) -> Vec<Vec<Vec<u8>>> {
-    let mut characters: Vec<u8> = (0..=255).collect();
-    seeded_shuffle(&mut characters, seed as usize);
+static TABLE3_ROW_CACHE: once_cell::sync::Lazy<RwLock<HashMap<u128, Arc<Vec<u8>>>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
-    (0..size)
+#[inline(always)]
+fn table_row_cache_key(seed: u64, i: u32, j: u32) -> u128 {
+    ((seed as u128) << 64) | ((i as u128) << 32) | (j as u128)
+}
+
+fn derive_subkeys_with_salt(
+    key1: &Secret<Vec<u8>>,
+    key2: &Secret<Vec<u8>>,
+    salt: &[u8],
+) -> (u64, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let k1 = key1.expose_secret();
+    let k2 = key2.expose_secret();
+
+
+    let mut ikm = Vec::with_capacity(k1.len() + k2.len());
+    ikm.extend_from_slice(k1);
+    ikm.extend_from_slice(k2);
+
+    let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+
+    let (seed_bytes, keys) = rayon::join(
+        || {
+            let mut seed_bytes = [0u8; 8];
+            hk.expand(b"seed", &mut seed_bytes).expect("HKDF expand seed");
+            seed_bytes
+        },
+        || {
+            let (xor_key, rest) = rayon::join(
+                || {
+                    let mut xor_key = vec![0u8; KEY_LENGTH];
+                    hk.expand(b"xor_key", &mut xor_key).expect("HKDF expand xor");
+                    xor_key
+                },
+                || {
+                    let (rot_key, hmac_key) = rayon::join(
+                        || {
+                            let mut rot_key = vec![0u8; KEY_LENGTH];
+                            hk.expand(b"rot_key", &mut rot_key).expect("HKDF expand rot");
+                            rot_key
+                        },
+                        || {
+                            let mut hmac_key = vec![0u8; 32];
+                            hk.expand(b"hmac_key", &mut hmac_key).expect("HKDF expand hmac");
+                            hmac_key
+                        }
+                    );
+                    (rot_key, hmac_key)
+                }
+            );
+            (xor_key, rest.0, rest.1)
+        }
+    );
+
+    let seed_u64 = u64::from_le_bytes(seed_bytes);
+
+    ikm.zeroize();
+
+    (seed_u64, keys.0, keys.1, keys.2)
+}
+
+
+thread_local! {
+    static ARGON2_INSTANCE: Argon2<'static> = {
+        let params = Params::new(65536, 3, 1, None).expect("valid params");
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+    };
+}
+
+fn gene3_with_salt(seed: &[u8], salt: &[u8]) -> Secret<Vec<u8>> {
+    ARGON2_INSTANCE.with(|argon2| {
+        let mut out = vec![0u8; 64];
+        argon2
+            .hash_password_into(seed, salt, &mut out)
+            .expect("Argon2 hashing failed");
+
+        let hk = Hkdf::<Sha256>::new(Some(salt), &out);
+        let mut okm = vec![0u8; KEY_LENGTH];
+        hk.expand(b"key_expand", &mut okm).expect("HKDF expand failed");
+
+        out.zeroize();
+        Secret::new(okm)
+    })
+}
+
+fn insert_random_stars(word: Vec<u8>) -> Vec<u8> {
+    if word.is_empty() {
+        return word;
+    }
+
+    let min = (word.len() / 2) as u64;
+    let max = word.len() as u64;
+    let mut rng = rng();
+    let range = if max > min { max - min + 1 } else { 1 };
+    let offset = if range == 0 { 0 } else { rng.next_u64() % range };
+    let num_stars = (min + offset) as usize;
+
+    let mut indices: Vec<usize> = (0..num_stars)
         .into_par_iter()
-        .map(|i| {
-            (0..size)
-                .map(|j| {
-                    (0..size)
-                        .map(|k| {
-                            let idx: usize = (i + j + k) % size;
-                            characters[idx]
-                        })
-                        .collect::<Vec<u8>>()
-                })
-                .collect::<Vec<Vec<u8>>>()
+        .map(|_| {
+            let mut local_rng = rand::rng();
+            (local_rng.next_u64() as usize) % (word.len() + 1)
         })
-        .collect::<Vec<Vec<Vec<u8>>>>()
-}
+        .collect();
 
+    indices.par_sort_unstable_by(|a, b| b.cmp(a));
 
-/// Retourne le sel pré-calculé pour la dérivation rituelle
-fn get_salt() -> String {
-    SALT.clone()
-}
-
-/// Somme les valeurs d'une adresse MAC en parallèle
-fn addition_chiffres(adresse_mac: &Vec<u8>) -> u64 {
-    adresse_mac.par_iter().map(|&x| x as u64).sum()
-}
-
-/// Génère une clé secondaire à partir d'une graine
-fn generate_key2(seed: &str) -> Result<Secret<Vec<u8>>, SystemTrayError> {
-    if seed.len() < 10 {
-        return Err(SystemTrayError::new(4));
+    let mut result = word;
+    for idx in indices {
+        let pos = if idx <= result.len() { idx } else { result.len() };
+        result.insert(pos, 0u8);
     }
-    if get_salt().len() < 10 {
-        return Err(SystemTrayError::new(10));
-    }
-    Ok(gene3(seed.as_bytes()))
+
+    result
 }
 
-/// Dérive le matériau clé sacré en utilisant Argon2
-fn gene3(seed: &[u8]) -> Secret<Vec<u8>> {
-    let mut output_key_material = vec![0u8; KEY_LENGTH];
-    Argon2::default()
-        .hash_password_into(seed, get_salt().as_ref(), &mut output_key_material)
-        .expect("Hashing failed");
-    Secret::new(output_key_material)
-}
+fn generate_row_direct(salt: &[u8], seed: u64, table_2d: usize, row: usize) -> Vec<u8> {
+    let mut ikm = Vec::with_capacity(24);
+    ikm.extend_from_slice(&seed.to_le_bytes());
+    ikm.extend_from_slice(&(table_2d as u64).to_le_bytes());
+    ikm.extend_from_slice(&(row as u64).to_le_bytes());
 
-/// Insère des étoiles aléatoires dans le vecteur, en optimisant l'accès au générateur d'entropie
-fn insert_random_stars(mut word: Vec<u8>) -> Vec<u8> {
-    // Utilisation d'un Arc pour le générateur d'entropie et réduction de contention par acquisition groupée
-    let rng_arc = Arc::new(Mutex::new(Nebula::new(secured_seed())));
-    
-    // Générer le nombre sacré d'étoiles en une seule acquisition
-    let num_stars: usize = {
-        let mut rng = rng_arc.lock().unwrap();
-        rng.generate_bounded_number((word.len() / 2) as u128, word.len() as u128)
-            .unwrap() as usize
+    let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+
+    let mut randbuf = vec![0u64; 256]; // Directement en u64 pour éviter les conversions
+    let randbuf_u8 = unsafe {
+        std::slice::from_raw_parts_mut(randbuf.as_mut_ptr() as *mut u8, randbuf.len() * 8)
     };
+    hk.expand(b"perm_row", randbuf_u8).expect("HKDF expand perm_row");
 
-    // Pré-calculer la liste des indices aléatoires en une acquisition groupée
-    let random_indices: Vec<usize> = {
-        let mut rng = rng_arc.lock().unwrap();
-        (0..num_stars)
-            .map(|_| rng.generate_bounded_number(0, word.len() as u128).unwrap() as usize)
-            .collect()
-    };
+    let mut perm: Vec<u8> = (0u8..=255u8).collect();
 
-    // Trie descendant pour éviter le décalage des indices lors des insertions
-    let mut sorted_indices = random_indices;
-    sorted_indices.par_sort_unstable_by(|a, b| b.cmp(a));
-
-    for index in sorted_indices {
-        word.insert(index, 0); // Insertion de la valeur sacrée (0 dans ce rituel)
+    for (k_idx, &r) in randbuf.iter().enumerate().take(255).rev() {
+        let jrand = (r as usize) % (k_idx + 1);
+        perm.swap(k_idx, jrand);
     }
-    word
+
+    ikm.zeroize();
+    perm
 }
 
-/// Construit une nouvelle clé secrète issue de multiples opérations arithmétiques sacrées
-fn vz_maker(val1: u64, val2: u64, seed: u64) -> Secret<Vec<u8>> {
-    gene3(&[
-        (val1 + val2) as u8,
-        (val1 % val2) as u8,
-        seed as u8,
-        val1.abs_diff(val2) as u8,
-        val1.wrapping_mul(val2) as u8,
-    ])
+fn get_table_row(salt: &[u8], seed: u64, table_2d: usize, row: usize) -> Arc<Vec<u8>> {
+    let key = table_row_cache_key(seed, table_2d as u32, row as u32);
+
+    {
+        let cache = TABLE3_ROW_CACHE.read().unwrap();
+        if let Some(v) = cache.get(&key) {
+            return Arc::clone(v);
+        }
+    }
+
+    // Génération et insertion atomique
+    let perm = generate_row_direct(salt, seed, table_2d, row);
+    let arc = Arc::new(perm);
+
+    {
+        let mut cache = TABLE3_ROW_CACHE.write().unwrap();
+        cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+    }
+
+    arc
 }
 
-/// Chiffre le message sacré en combinant substitutions, XOR et rotations binaires
+fn prefetch_table_rows(salt: &[u8], seed: u64, pairs: &[(usize, usize)]) {
+    if pairs.is_empty() {
+        return;
+    }
+
+    let mut needed_keys = HashSet::with_capacity(pairs.len());
+    for &(i, j) in pairs {
+        needed_keys.insert(table_row_cache_key(seed, i as u32, j as u32));
+    }
+
+    {
+        let cache = TABLE3_ROW_CACHE.read().unwrap();
+        needed_keys.retain(|k| !cache.contains_key(k));
+    }
+
+    if needed_keys.is_empty() {
+        return;
+    }
+
+    let to_generate: Vec<_> = needed_keys
+        .into_iter()
+        .map(|k| {
+            let i = ((k >> 32) & 0xffffffff) as u32 as usize;
+            let j = (k & 0xffffffff) as u32 as usize;
+            (k, i, j)
+        })
+        .collect();
+
+
+    const CHUNK_SIZE: usize = 32;
+    let generated: Vec<_> = to_generate
+        .par_chunks(CHUNK_SIZE)
+        .flat_map(|chunk| {
+            chunk.iter().map(|(k, i, j)| {
+                let perm = generate_row_direct(salt, seed, *i, *j);
+                (*k, Arc::new(perm))
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    {
+        let mut cache = TABLE3_ROW_CACHE.write().unwrap();
+        cache.reserve(generated.len()); // Pré-allocation
+        for (k, arc) in generated {
+            cache.entry(k).or_insert(arc);
+        }
+    }
+}
+
+#[inline(always)]
+fn shift_bits_with_rot_key_par(mut buf: Vec<u8>, rot_key: &[u8]) -> Vec<u8> {
+    // Traitement par chunks pour améliorer la localité des données
+    const CHUNK_SIZE: usize = 1024;
+    buf.par_chunks_mut(CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * CHUNK_SIZE;
+            chunk.iter_mut().enumerate().for_each(|(i, byte)| {
+                let idx = base_idx + i;
+                let amount = (rot_key[idx % rot_key.len()] & 0x07) as u32;
+                *byte = byte.rotate_left(amount);
+            });
+        });
+    buf
+}
+
+#[inline(always)]
+fn unshift_bits_with_rot_key_par(mut buf: Vec<u8>, rot_key: &[u8]) -> Vec<u8> {
+    const CHUNK_SIZE: usize = 1024;
+    buf.par_chunks_mut(CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * CHUNK_SIZE;
+            chunk.iter_mut().enumerate().for_each(|(i, byte)| {
+                let idx = base_idx + i;
+                let amount = (rot_key[idx % rot_key.len()] & 0x07) as u32;
+                *byte = byte.rotate_right(amount);
+            });
+        });
+    buf
+}
+
+#[inline(always)]
+fn compute_hmac(hmac_key: &[u8], header: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC key size");
+    mac.update(header);
+    mac.update(ciphertext);
+    mac.finalize().into_bytes().to_vec()
+}
+
+#[inline(always)]
+fn verify_hmac(hmac_key: &[u8], header: &[u8], ciphertext: &[u8], tag: &[u8]) -> bool {
+    let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC key size");
+    mac.update(header);
+    mac.update(ciphertext);
+    mac.verify_slice(tag).is_ok()
+}
 pub(crate) fn encrypt3(
     plain_text: Vec<u8>,
     key1: &Secret<Vec<u8>>,
     key2: &Secret<Vec<u8>>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let inter = insert_random_stars(plain_text);
+    if plain_text.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let key1_bytes = key1.expose_secret();
-    let key2_bytes = key2.expose_secret();
+    let mut salt = vec![0u8; SALT_LEN];
+    rng().fill_bytes(&mut salt);
+    let (seed_u64, mut xor_key, mut rot_key, mut hmac_key) = derive_subkeys_with_salt(key1, key2, &salt);
 
-    // Pré-calcul des sommes d'énergie
-    let val1 = addition_chiffres(key2_bytes);
-    let val2 = addition_chiffres(key1_bytes);
-    let seed = val2 * val1;
+    let (characters, key_chars) = rayon::join(
+        || {
+            let mut characters: Vec<u8> = (0u8..=255u8).collect();
+            let seed_bytes = seed_u64.to_le_bytes();
+            let hk = Hkdf::<Sha256>::new(Some(&salt), &seed_bytes);
+            let mut randbuf = vec![0u64; 256];
+            let randbuf_u8 = unsafe {
+                std::slice::from_raw_parts_mut(randbuf.as_mut_ptr() as *mut u8, randbuf.len() * 8)
+            };
+            hk.expand(b"chars_perm", randbuf_u8).unwrap();
+            for (k_idx, &r) in randbuf.iter().enumerate().take(255).rev() {
+                let jrand = (r as usize) % (k_idx + 1);
+                characters.swap(k_idx, jrand);
+            }
+            characters
+        },
+        || {
+            let key1_bytes = key1.expose_secret();
+            let key2_bytes = key2.expose_secret();
+            rayon::join(
+                || key1_bytes.iter().map(|&c| c as usize % 256).collect::<Vec<_>>(),
+                || key2_bytes.iter().map(|&c| c as usize % 256).collect::<Vec<_>>()
+            )
+        },
+    );
 
-    let mut characters: Vec<u8> = (0..=255).collect();
-    let table = table3(256, seed);
-
-    seeded_shuffle(&mut characters, seed as usize);
-
-    let char_positions: HashMap<_, _> = characters
-        .par_iter()
+    let char_positions: HashMap<_, _> = characters.iter()
         .enumerate()
         .map(|(i, &c)| (c, i))
         .collect();
 
-    let table_len = 256;
-    let key1_chars: Vec<usize> = key1_bytes.into_par_iter().map(|&c| c as usize % 256).collect();
-    let key2_chars: Vec<usize> = key2_bytes.into_par_iter().map(|&c| c as usize % 256).collect();
+    let (key1_chars, key2_chars) = key_chars;
 
-    let mut cipher_text: Vec<u8> = inter
+    let pairs: Vec<_> = plain_text
         .par_iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            let table_2d = key1_chars[i % key1_chars.len()] % table_len;
-            let row = key2_chars[i % key2_chars.len()] % table_len;
-            if let Some(col) = char_positions.get(c).map(|&col| col % 256) {
-                if table_2d < table_len && row < table[table_2d].len() && col < table[table_2d][row].len() {
-                    Some(table[table_2d][row][col])
+        .map(|(i, _)| {
+            let table_2d = key1_chars[i % key1_chars.len()] % 256;
+            let row = key2_chars[i % key2_chars.len()] % 256;
+            (table_2d, row)
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    prefetch_table_rows(&salt, seed_u64, &pairs);
+
+    let mut keystream = vec![0u8; plain_text.len()];
+    {
+        let hk = Hkdf::<Sha256>::new(None, &xor_key);
+        hk.expand(b"ks", &mut keystream).unwrap();
+    }
+
+    let cipher_text: Vec<u8> = plain_text
+        .par_chunks(256) // Réduction de la taille des blocs pour une meilleure utilisation du cache
+        .enumerate()
+        .flat_map(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * 256;
+            chunk.par_iter().enumerate().map(|(i, &c)| {
+                let global_idx = base_idx + i;
+                let table_2d = key1_chars[global_idx % key1_chars.len()] % 256;
+                let row = key2_chars[global_idx % key2_chars.len()] % 256;
+
+                let row_vec = get_table_row(&salt, seed_u64, table_2d, row);
+
+                let mut val = if let Some(&col) = char_positions.get(&c) {
+                    if col < row_vec.len() {
+                        row_vec[col]
+                    } else {
+                        characters[col]
+                    }
                 } else {
-                    // Hérésie: l'indice n'est pas dans le répertoire sacré
-                    None
-                }
-            } else {
-                None
-            }
+                    c
+                };
+                val ^= keystream[global_idx % keystream.len()];
+                val
+            }).collect::<Vec<_>>()
         })
         .collect();
 
-        // Rotation rituelle de la clé avant application de XOR
-        let mut key_clone = key1_bytes.clone();
-        key_clone.rotate_left(seed as usize % 64);
-        xor_crypt3(&mut cipher_text, &key_clone);
-        let vz = vz_maker(val1, val2, seed);
-        Ok(shift_bits(cipher_text, vz))
+    let cipher_text = shift_bits_with_rot_key_par(cipher_text, &rot_key);
+
+    let mut header = Vec::with_capacity(SALT_LEN + 8);
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&seed_u64.to_le_bytes());
+    let tag = compute_hmac(&hmac_key, &header, &cipher_text);
+
+    let mut package = header;
+    package.extend_from_slice(&cipher_text);
+    package.extend_from_slice(&tag);
+
+    xor_key.zeroize();
+    rot_key.zeroize();
+    hmac_key.zeroize();
+
+    Ok(package)
 }
 
-/// Déchiffre le message sacré en inversant les transformations rituelles appliquées
 pub(crate) fn decrypt3(
-    cipher_text: Vec<u8>,
+    package: Vec<u8>,
     key1: &Secret<Vec<u8>>,
     key2: &Secret<Vec<u8>>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let key1_bytes = key1.expose_secret();
-    let key2_bytes = key2.expose_secret();
+    if package.len() < SALT_LEN + 8 + 32 {
+        return Err("ciphertext too short".into());
+    }
 
-    let val1 = addition_chiffres(key2_bytes);
-    let val2 = addition_chiffres(key1_bytes);
-    let seed = val2 * val1;
+    let salt = &package[..SALT_LEN];
+    let seed_bytes = &package[SALT_LEN..SALT_LEN + 8];
+    let cipher_and_tag = &package[SALT_LEN + 8..];
 
-    let mut characters: Vec<u8> = (0..=255).collect();
-    seeded_shuffle(&mut characters, seed as usize);
-    let table = table3(256, seed);
-    let table_len = 256;
+    if cipher_and_tag.len() < 32 {
+        return Err("ciphertext too short (no tag)".into());
+    }
 
-    let vz = vz_maker(val1, val2, seed);
-    let mut cipher_text = unshift_bits(cipher_text, vz);
-    let mut key_clone = key1_bytes.clone();
-    key_clone.rotate_left(seed as usize % 64);
-    xor_crypt3(&mut cipher_text, &key_clone);
+    let tag_pos = cipher_and_tag.len() - 32;
+    let cipher_text = &cipher_and_tag[..tag_pos];
+    let tag = &cipher_and_tag[tag_pos..];
 
-    let key1_chars: Vec<usize> = key1_bytes.into_par_iter().map(|&c| c as usize % 256).collect();
-    let key2_chars: Vec<usize> = key2_bytes.into_par_iter().map(|&c| c as usize % 256).collect();
+    let (seed_u64_from_keys, mut xor_key, mut rot_key, mut hmac_key) =
+        derive_subkeys_with_salt(key1, key2, salt);
+    let seed_from_header = u64::from_le_bytes(seed_bytes.try_into().unwrap());
 
-    let plain_text: Vec<u8> = cipher_text
-        .par_iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let table_2d = key1_chars[i % key1_chars.len()] % table_len;
-            let row = key2_chars[i % key2_chars.len()] % table_len;
-            if table_2d < table_len && row < table[table_2d].len() {
-                if let Some(col) = table[table_2d][row].iter().position(|x| x == c) {
-                    if characters[col] != 0 {
-                        Some(characters[col])
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+    if seed_from_header != seed_u64_from_keys {
+        return Err("seed mismatch (keys/salt)".into());
+    }
+
+    let seed_u64 = seed_from_header;
+
+    let header = &package[..SALT_LEN + 8];
+    if !verify_hmac(&hmac_key, header, cipher_text, tag) {
+        return Err("HMAC verification failed".into());
+    }
+
+    let (characters, key_chars_and_keystream) = rayon::join(
+        || {
+            let mut characters: Vec<u8> = (0u8..=255u8).collect();
+            let seed_b = seed_u64.to_le_bytes();
+            let hk = Hkdf::<Sha256>::new(Some(salt), &seed_b);
+            let mut randbuf = vec![0u64; 256];
+            let randbuf_u8 = unsafe {
+                std::slice::from_raw_parts_mut(randbuf.as_mut_ptr() as *mut u8, randbuf.len() * 8)
+            };
+            hk.expand(b"chars_perm", randbuf_u8).unwrap();
+            for (k_idx, &r) in randbuf.iter().enumerate().take(255).rev() {
+                let jrand = (r as usize) % (k_idx + 1);
+                characters.swap(k_idx, jrand);
             }
+            characters
+        },
+        || {
+            let (key_chars, keystream) = rayon::join(
+                || {
+                    let key1_bytes = key1.expose_secret();
+                    let key2_bytes = key2.expose_secret();
+                    rayon::join(
+                        || key1_bytes.iter().map(|&c| c as usize % 256).collect::<Vec<_>>(),
+                        || key2_bytes.iter().map(|&c| c as usize % 256).collect::<Vec<_>>()
+                    )
+                },
+                || {
+                    let mut keystream = vec![0u8; cipher_text.len()];
+                    let hk = Hkdf::<Sha256>::new(None, &xor_key);
+                    hk.expand(b"ks", &mut keystream).unwrap();
+                    keystream
+                }
+            );
+            (key_chars, keystream)
+        }
+    );
+
+    let ((key1_chars, key2_chars), keystream) = key_chars_and_keystream;
+
+    let pairset: HashSet<(usize, usize)> = (0..cipher_text.len())
+        .into_par_iter()
+        .map(|i| {
+            let table_2d = key1_chars[i % key1_chars.len()] % 256;
+            let row = key2_chars[i % key2_chars.len()] % 256;
+            (table_2d, row)
         })
         .collect();
 
-    Ok(plain_text)
-}
+    let pairs: Vec<_> = pairset.into_iter().collect();
+    prefetch_table_rows(salt, seed_u64, &pairs);
 
-/// Applique l'opération XOR en parallèle pour obscurcir les données
-fn xor_crypt3(input: &mut [u8], key: &[u8]) {
-    input.par_iter_mut().enumerate().for_each(|(i, byte)| {
-        *byte ^= key[i % key.len()];
-    });
-}
+    let mut middle = unshift_bits_with_rot_key_par(cipher_text.to_vec(), &rot_key);
 
-/// Effectue un décalage binaire des octets en fonction d'une clé secrète
-pub fn shift_bits(cipher_text: Vec<u8>, key: Secret<Vec<u8>>) -> Vec<u8> {
-    let key = key.expose_secret();
-    cipher_text
-        .par_iter()
+    middle.par_iter_mut()
         .enumerate()
-        .map(|(i, &byte)| byte.rotate_left(key[i % key.len()] as u32))
-        .collect::<Vec<u8>>()
-}
+        .for_each(|(i, byte)| *byte ^= keystream[i % keystream.len()]);
 
-/// Inverse le décalage binaire précédemment appliqué
-pub fn unshift_bits(cipher_text: Vec<u8>, key: Secret<Vec<u8>>) -> Vec<u8> {
-    let key = key.expose_secret();
-    cipher_text
-        .par_iter()
+    const DECRYPT_CHUNK_SIZE: usize = 256;
+    let plain_with_stars: Vec<u8> = middle
+        .par_chunks(DECRYPT_CHUNK_SIZE)
         .enumerate()
-        .map(|(i, &byte)| byte.rotate_right(key[i % key.len()] as u32))
-        .collect::<Vec<u8>>()
+        .flat_map(|(chunk_idx, chunk)| {
+            let base_idx = chunk_idx * DECRYPT_CHUNK_SIZE;
+            chunk.par_iter().enumerate().map(|(i, &c)| {
+                let global_idx = base_idx + i;
+                let table_2d = key1_chars[global_idx % key1_chars.len()] % 256;
+                let row = key2_chars[global_idx % key2_chars.len()] % 256;
+
+                let row_vec = get_table_row(salt, seed_u64, table_2d, row);
+
+                if let Some(col) = row_vec.iter().position(|x| *x == c) {
+                    if col < characters.len() {
+                        characters[col]
+                    } else {
+                        c
+                    }
+                } else {
+                    c
+                }
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    xor_key.zeroize();
+    rot_key.zeroize();
+    hmac_key.zeroize();
+
+    Ok(plain_with_stars)
 }
 
-/// Fonction rituelle orchestrant le processus complet de chiffrement et déchiffrement
-fn main() {
-    // Données sacrées et mot de passe
-    let original_data = "ce soir je sors ne t'inquiète pas je rentre bientôt";
-    let pass = "LeMOTdePAsse34!";
+fn main() -> Result<(), Box<dyn Error>> {
+    let original_data = b"ce soir je sors ne t'inquiete pas je rentre bientot".to_vec();
+    let pass = b"LeMOTdePAsse34!";
 
     const ROUND: usize = 6;
 
-    let key1 = gene3(pass.as_bytes());
+    // Salt de run avec meilleure entropie
+    let mut run_salt = vec![0u8; SALT_LEN];
+    rng().fill_bytes(&mut run_salt);
+    let key1 = gene3_with_salt(pass, &run_salt);
 
-    // Génération d'une liste de clés rituelles aléatoires
-    let mut rng = Nebula::new(123456789);
+    // Génération parallèle des clés
     let liste: Vec<String> = (0..ROUND)
-        .map(|_| rng.generate_random_number().to_string())
+        .into_par_iter()
+        .map(|_| {
+            let mut rng = rand::rng();
+            let mut rnum = [0u8; 8];
+            rng.fill_bytes(&mut rnum);
+            u64::from_le_bytes(rnum).to_string()
+        })
         .collect();
 
-    let mut chif = original_data.as_bytes().to_vec();
+    // Insertion des étoiles une seule fois
+    let mut chif = insert_random_stars(original_data.clone());
 
-    // Enchiffrement sur plusieurs cycles pour renforcer la protection sacrée
+    // Chiffrement séquentiel (nécessaire pour préserver la chaîne)
+    let start = std::time::Instant::now();
     for (index, element) in liste.iter().enumerate() {
-        let key2 = gene3(element.as_bytes());
-        chif = if index < 1 {
-            encrypt3(chif, &key1, &key2).unwrap()
-        } else {
-            encrypt_file(chif, &key1, &key2).unwrap()
-        };
-
-        println!("{} Chiffré : {}", index, String::from_utf8_lossy(&chif));
+        let key2 = gene3_with_salt(element.as_bytes(), &run_salt);
+        chif = encrypt3(chif, &key1, &key2)?;
+        println!("{} Chiffré (len={})", index, chif.len());
     }
+    println!("Chiffrement total: {:?}", start.elapsed());
 
     println!("-----------------------------------------");
 
-    // Déchiffrement en inversant les cycles rituels
-    for (index, element) in liste.iter().enumerate().rev() {
-        let key2 = gene3(element.as_bytes());
-        chif = if index < 1 {
-            decrypt3(chif, &key1, &key2).unwrap()
-        } else {
-            decrypt_file(chif, &key1, &key2).unwrap()
-        };
-
-        println!("{} déChiffré : {}", index, String::from_utf8_lossy(&chif));
+    // Déchiffrement en ordre inverse
+    let start = std::time::Instant::now();
+    for element in liste.iter().rev() {
+        let key2 = gene3_with_salt(element.as_bytes(), &run_salt);
+        chif = decrypt3(chif, &key1, &key2)?;
+        println!("Déchiffré étape (len={})", chif.len());
     }
+    println!("Déchiffrement total: {:?}", start.elapsed());
 
-    assert_eq!(original_data, String::from_utf8_lossy(&chif));
-}
+    // Suppression des zéros insérés
+    let chif_stripped: Vec<u8> = chif.into_par_iter().filter(|&b| b != 0u8).collect();
+    println!("Après suppression des 0 : len={}", chif_stripped.len());
+    println!(
+        "Texte final (utf8 lossy): {}",
+        String::from_utf8_lossy(&chif_stripped)
+    );
 
+    assert_eq!(original_data, chif_stripped);
+    println!("Roundtrip OK.");
 
-
-#[cfg(test)]
-mod tests {
-    use std::fs::File;
-
-    use crate::cryptex::{decrypt_file, encrypt_file};
-
-    use super::*;
-
-    #[test]
-/// Tests file encryption and decryption.
-///
-/// This function demonstrates the process of encrypting and decrypting the content of a file.
-/// It reads the content of a file, encrypts it using the `encrypt_file` function, then decrypts it back using the `decrypt_file` function.
-/// Finally, it verifies that the decrypted content matches the original content of the file.
-///
-/// # Note
-///
-/// This function is meant for testing purposes and should be adapted or extended for actual use cases.
-///
-/// # Examples
-///
-/// ```
-/// // Execute the test for file encryption and decryption
-/// test_crypt_file();
-/// ```
-    fn test_crypt_file(){
-        //let password = "bonjourcestmoi";
-        //let key1 = generate_key2(password);
-        //let key2 = generate_key2(password);
-        //let key3 = generate_key2(password);
-
-
-        //let mut file_content = Vec::new();
-        //let mut file = File::open("invoicesample.pdf").unwrap();
-        //file.read_to_end(&mut file_content).expect("TODO: panic message");
-
-        //let encrypted_content = encrypt_file(file_content.clone(), &key1.unwrap(), &key2.unwrap());
-
-        //let b = encrypted_content.unwrap();
-
-
-        //let dcrypted_content = decrypt_file(b, &key1.unwrap(), &key3.unwrap());
-        //let a = dcrypted_content.unwrap();
-        //assert_eq!(a.clone(), file_content);
-    }
-
-    #[test]
-    fn test_table3() {
-        let size = 255;
-
-        let table = table3(size, 123456789);
-
-        for (_i, table_2d) in table.iter().enumerate() {
-            for (_j, row) in table_2d.iter().enumerate() {
-                for (_k, col) in row.iter().enumerate() {
-                    print!("{} ", col);
-                }
-
-                println!();
-            }
-
-            println!();
-            println!();
-        }
-    }
-
-    #[test]
-    fn test_speed_table(){
-        let size = 255;
-        table3(size, 123456789);
-    }
-
-    #[test]
-    fn test_get_salt() {
-        let salt = get_salt();
-        assert_ne!(salt.len(), 0);
-    }
-
-    #[test]
-    fn test_generate_key2() {
-        let seed = "0123456789";
-        let key = generate_key2(seed).unwrap();
-
-
-        assert_ne!(key.expose_secret().len(), 0)
-    }
-
-    #[test]
-    fn test_insert_random_stars() {
-        let word = "Hello World!".as_bytes().to_vec();
-        let word2 = insert_random_stars(word.clone());
-
-        println!("Word: {:?}", word2);
-        assert_ne!(word, word2);
-    }
-
-
-    #[test]
-    fn test_shift_unshift_bits() {
-        let original_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10,1, 2, 3, 4, 5, 6, 7, 8, 9, 10,1, 2, 3, 4, 5, 6, 7, 8, 9, 10,1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let key = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-
-        let shifted_data = shift_bits(original_data.clone(), Secret::new(key.clone()));
-        let unshifted_data = unshift_bits(shifted_data, Secret::new(key));
-
-        assert_eq!(original_data, unshifted_data);
-    }
-
-    use std::io::Write;
-    use std::io::{BufRead, BufReader};
-
-
-
-    #[test]
-    fn test_gene3() {
-        let seed = b"test_seed"; // Exemple de graine
-        let secret = gene3(seed);
-
-        // Vérifier que le matériel de clé de sortie a la bonne longueur
-        assert_eq!(secret.expose_secret().len(), KEY_LENGTH);
-
-        // Vous pouvez également vérifier que le matériel de clé de sortie n'est pas vide
-        assert!(!secret.expose_secret().is_empty());
-    }
-
-    #[test]
-    fn test_gene3_different_seeds() {
-        let seed1 = b"seed_one";
-        let seed2 = b"seed_two";
-
-        let secret1 = gene3(seed1);
-        let secret2 = gene3(seed2);
-
-        // Vérifier que les résultats sont différents pour des graines différentes
-        assert_ne!(secret1.expose_secret(), secret2.expose_secret());
-    }
-
+    Ok(())
 }
