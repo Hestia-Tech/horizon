@@ -7,13 +7,9 @@ edition = "2021"
 
 [dependencies]
 rayon = "*"
-sysinfo = "0.31.4"
-blake3 = "1.5.1"
-hex = "0.4.3"
 argon2 = "*"
 
 secrecy = { version = "0.8.0", features = ["alloc"] }
-hashbrown = { version = "0.15.5", features = ["rayon"] }
 rand = "*"
 once_cell = "*"
 hkdf = "0.13.0-rc.0"
@@ -23,11 +19,10 @@ zeroize = "1.8.1"
 dashmap = "7.0.0-rc2"
 
 [profile.release]
-lto = "fat"              # Link Time Optimization
-codegen-units = 1        # Meilleure optimisation
-panic = "abort"          # Binaire plus petit
-opt-level = 3            # Optimisation maximale
-
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
 
 [profile.bench]
 inherits = "release"
