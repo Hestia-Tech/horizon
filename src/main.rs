@@ -18,13 +18,13 @@ use blake3::Hasher;
 
 const KEY_LENGTH: usize = 512;
 const SALT_LEN: usize = 32;
-const VERSION: u8 = 3;
-const ALG_ID: u8 = 1;
+const VERSION: u8 = 4;
+const ALG_ID: u8 = 173;
 const MAX_CACHE_ENTRIES: usize = 80_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
-static ROW_CACHE: Lazy<DashMap<[u8; 32], Arc<[u8; 256]>>> = Lazy::new(|| DashMap::new());
+static ROW_CACHE: Lazy<DashMap<[u8; 32], Arc<[u8; 256]>>> = Lazy::new(DashMap::new);
 
 static MASTER_CACHE_KEY: Lazy<[u8; 32]> = Lazy::new(|| {
     let rng = SystemRandom::new();
@@ -164,7 +164,7 @@ fn insert_random_stars_escaped(word: Vec<u8>) -> Vec<u8> {
     fill_random(&mut rng_buf);
     let mut rbase = u64::from_le_bytes(rng_buf);
     let range = if max > min { max - min + 1 } else { 1 };
-    let offset = if range == 0 { 0 } else { (rbase % range) as u64 };
+    let offset = if range == 0 { 0 } else { rbase % range};
     let num_stars = (min + offset) as usize;
     let mut positions: Vec<usize> = Vec::with_capacity(num_stars);
     for _ in 0..num_stars {
@@ -323,7 +323,7 @@ fn encrypt_core(
     let (characters, key_chars) = rayon::join(
         || {
             let mut characters: Vec<u8> = (0u8..=255u8).collect();
-            let mut hasher = blake3::Hasher::new();
+            let mut hasher = Hasher::new();
             hasher.update(run_salt);
             hasher.update(round_seed);
             hasher.update(b"chars_perm_v1");
@@ -451,7 +451,7 @@ fn decrypt_core(
     let (characters, key_chars_and_keystream) = rayon::join(
         || {
             let mut characters: Vec<u8> = (0u8..=255u8).collect();
-            let mut hasher = blake3::Hasher::new();
+            let mut hasher = Hasher::new();
             hasher.update(run_salt);
             hasher.update(round_seed);
             hasher.update(b"chars_perm_v1");
@@ -672,7 +672,7 @@ fn prefetch_table_rows(salt: &[u8], seed: u64, pairs: &[(usize, usize)]) {
     if pairs.is_empty() {
         return;
     }
-    let mut needed_keys = std::collections::HashSet::with_capacity(pairs.len());
+    let mut needed_keys = HashSet::with_capacity(pairs.len());
     for &(i, j) in pairs {
         let key = table_row_cache_key_mastered(seed, i as u32, j as u32);
         needed_keys.insert(key);
@@ -839,7 +839,7 @@ mod tests {
             let round_keys_bad = vec![b"x1".to_vec(), b"x2".to_vec()];
             let data = b"top secret".to_vec();
             let enc = encrypt3_final(data.clone(), &key1, &key2, &round_keys_good).expect("encrypt");
-            let r = decrypt3_final(enc, &key1, &key2, &round_keys_bad);
+            let _r = decrypt3_final(enc, &key1, &key2, &round_keys_bad);
             //assert!(r.is_err());
         }
 
