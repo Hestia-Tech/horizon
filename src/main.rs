@@ -57,7 +57,6 @@ const KEY_LENGTH: usize = 512;
 const SALT_LEN: usize = 32;
 const VERSION: u8 = 4;
 const ALG_ID: u8 = 173;
-const MAX_CACHE_ENTRIES: usize = 80_000;
 
 fn fill_random(dest: &mut [u8]) {
     let rng = SystemRandom::new();
