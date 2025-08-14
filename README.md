@@ -212,11 +212,3 @@ Before submitting cryptography-related changes, explain the intended security mo
 ## License
 
 This project is distributed under the **AGPLv3** license (see `LICENSE`).
-
----
-
-If you want, I can also produce:
-
-* A minimal quickstart `README` (shorter, for end users),
-* A developer guide explaining internals and perf tuning (caching, rayon tuning, Argon2 params), or
-* A machine-readable API doc snippet for `encrypt3_final` / `decrypt3_final`.
